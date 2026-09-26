@@ -1,0 +1,26 @@
+# Environment & Secrets
+.env
+.env.*
+*.env
+*client_secret*.json
+*.pem
+*.key
+
+# Backend / Python
+backend/venv/
+backend/.venv/
+**/__pycache__/
+*.pyc
+backend/open.pdf
+
+# Frontend / Node
+frontend/node_modules/
+frontend/dist/
+frontend/dist-ssr/
+frontend/*.local
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
