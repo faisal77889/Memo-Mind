@@ -1,18 +1,20 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
 from typing import Optional
 import os
+import base64
 from urllib.parse import quote
 from app.database import get_db
-from app.models import User
+from app.models import User, DataSources, SourceType
 import httpx
+from celery.result import AsyncResult
 import jwt
 from google.oauth2 import id_token
-from google.auth.transport import requests as google_requests
 from datetime import datetime, timedelta
+from app.tasks import celery_app, sync_gmail_messages, sync_drive_messages
 
 load_dotenv(override=True)
 
@@ -27,6 +29,40 @@ GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 frontend_url = os.getenv("FRONTEND_URL", "http://localhost:5173")
 
+
+workspace_mimes = {
+    "application/vnd.google-apps.document": "application/pdf",
+    "application/vnd.google-apps.spreadsheet": "application/pdf",
+    "application/vnd.google-apps.presentation": "application/pdf",
+    "application/vnd.google-apps.drawing": "application/pdf",
+}
+
+workspace_extensions = {
+    "application/vnd.google-apps.document": "pdf",
+    "application/vnd.google-apps.spreadsheet": "pdf",
+    "application/vnd.google-apps.presentation": "pdf",
+    "application/vnd.google-apps.drawing": "pdf",
+}
+
+mime_extensions = {
+    "application/pdf": "pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/msword": "doc",
+    "application/vnd.ms-excel": "xls",
+    "application/vnd.ms-powerpoint": "ppt",
+    "text/plain": "txt",
+    "text/csv": "csv",
+    "text/html": "html",
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "application/zip": "zip",
+    "application/json": "json",
+}
+
 BACKEND_URL = "http://localhost:8000"
 
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -40,7 +76,6 @@ def create_access_token(user_id: int) -> str:
     }
     return jwt.encode(payload, os.getenv("JWT_SECRET"), algorithm="HS256")
 
-
 def verify_token(token: str) -> dict:
     try:
         return jwt.decode(
@@ -52,7 +87,6 @@ def verify_token(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
-
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
@@ -70,7 +104,6 @@ def get_current_user(
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
-
 
 async def get_google_access_token(refresh_token: str, db: Session, user: User) -> str:
     """Exchange a Google refresh token for a fresh access token."""
@@ -106,6 +139,32 @@ async def get_google_access_token(refresh_token: str, db: Session, user: User) -
 
     return google_access_token
 
+async def get_file_info(file_id : str,google_access_token: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            url=f"https://www.googleapis.com/drive/v3/files/{file_id}",
+            headers={"Authorization": f"Bearer {google_access_token}"},
+            params={"fields": "id,name,mimeType,size,modifiedTime,webViewLink"}
+        )
+        return response
+
+
+
+def decode_payload_data(part: dict):
+    if not isinstance(part, dict):
+        return
+    body = part.get("body")
+    if isinstance(body, dict) and "data" in body and isinstance(body["data"], str):
+        try:
+            raw_data = body["data"]
+            padded_data = raw_data + "=" * (-len(raw_data) % 4)
+            decoded_bytes = base64.urlsafe_b64decode(padded_data)
+            body["data"] = decoded_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            pass
+
+    for sub_part in part.get("parts", []):
+        decode_payload_data(sub_part)
 
 @router.get("/google/login")
 async def get_auth_url(
@@ -202,10 +261,6 @@ async def auth_google(code: str, db: Session = Depends(get_db)):
     our_token = create_access_token(new_user.id)
     return RedirectResponse(url=f"{frontend_url}/auth/callback?access_token={our_token}")
 
-
-# -------------------------------------------------------------------
-# Google Drive: list files
-# -------------------------------------------------------------------
 @router.get("/google/drive/files")
 async def get_drive_files(
     current_user: User = Depends(get_current_user),
@@ -241,35 +296,57 @@ async def get_drive_files(
     return drive_resp.json()
 
 
+@router.get("/download/google/drive/files/{file_id}")
+async def download_file(file_id : str,current_user : User = Depends(get_current_user),db : Session = Depends(get_db)):
 
-@router.get("/google/drive/files/{file_id}")
-async def get_drive_file(
-    file_id: str,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
     google_access_token = await get_google_access_token(
-        refresh_token=current_user.google_refresh_token,
-        db=db,
-        user=current_user,
+            refresh_token=current_user.google_refresh_token,
+            db=db,
+            user=current_user,
     )
 
-    async with httpx.AsyncClient() as client:
-        drive_resp = await client.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}",
-            headers={"Authorization": f"Bearer {google_access_token}"},
-            params={"fields": "id,name,mimeType,size,modifiedTime,webViewLink"},
-        )
+    file = db.query(DataSources).filter(DataSources.unique_id == file_id).first()
 
-    if drive_resp.status_code == 401:
+    if file :
+        raise HTTPException(status_code=409,detail="The File already exist in the database")
+
+    file_response = await get_file_info(file_id,google_access_token)
+
+    if file_response.status_code == 401:
         current_user.google_refresh_token = None
         db.commit()
         raise HTTPException(status_code=401, detail="Google access revoked. Please log in again.")
 
-    if drive_resp.status_code != 200:
-        raise HTTPException(status_code=502, detail=f"Drive API error: {drive_resp.text}")
+    mimeType = file_response.json().get("mimeType", "")
+    is_workspace = mimeType.startswith("application/vnd.google-apps") if mimeType else False
 
-    return drive_resp.json()
+    async with httpx.AsyncClient() as client:
+        if is_workspace:
+            url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export"
+            params = {"mimeType": workspace_mimes.get(mimeType, "application/pdf")}
+            ext = workspace_extensions.get(mimeType, "pdf")
+            filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}"
+        else:
+            url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
+            params = {"alt" : "media"}
+            ext = mime_extensions.get(mimeType, "pdf")
+            filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}"
+        async with client.stream(
+            "GET",
+            url=url,
+            params=params,
+            headers={"Authorization": f"Bearer {google_access_token}"}
+
+        ) as response:
+            response.raise_for_status()
+            with open(filename, "wb") as f:
+                async for chunk in response.aiter_bytes(65536):
+                    f.write(chunk)
+
+    return {
+        "message" : "successfull"
+    }
+
 
 
 @router.get("/google/drive/search")
@@ -279,16 +356,11 @@ async def search_drive_files(
     db: Session = Depends(get_db),
     page_size: int = 20,
 ):
-    """
-    Example: q=name contains 'report'
-    See: https://developers.google.com/drive/api/guides/search-files
-    """
     google_access_token = await get_google_access_token(
         refresh_token=current_user.google_refresh_token,
         db=db,
         user=current_user,
     )
-
     async with httpx.AsyncClient() as client:
         drive_resp = await client.get(
             "https://www.googleapis.com/drive/v3/files",
@@ -309,3 +381,117 @@ async def search_drive_files(
         raise HTTPException(status_code=502, detail=f"Drive API error: {drive_resp.text}")
 
     return drive_resp.json()
+
+
+@router.get("/google/gmail/list")
+async def get_all_gmail_messages(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    google_access_token = await get_google_access_token(
+        str(current_user.google_refresh_token), db, current_user
+    )
+
+    async with httpx.AsyncClient() as client:
+        gmail_response = await client.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/messages",
+            headers={"Authorization": f"Bearer {google_access_token}"},
+            params={"maxResults": 50},
+        )
+
+    if gmail_response.status_code == 401:
+        current_user.google_refresh_token = None
+        db.commit()
+        raise HTTPException(
+            status_code=401,
+            detail="Google access revoked. Please log in again.",
+        )
+
+    if gmail_response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gmail API error: {gmail_response.text}",
+        )
+
+    return gmail_response.json()
+
+
+
+
+@router.get("/gmail/messages/{message_id}")
+async def download_gmail_message(message_id : str,current_user : User = Depends(get_current_user),db : Session = Depends(get_db)):
+    google_access_token = await get_google_access_token(
+            str(current_user.google_refresh_token), db, current_user
+    )
+
+    async with httpx.AsyncClient() as client:
+        gmail_response = await client.get(
+            f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
+            headers={"Authorization": f"Bearer {google_access_token}"},
+            params={"format" : "full"}
+        )
+        
+
+    if gmail_response.status_code == 401:
+        current_user.google_refresh_token = None
+        db.commit()
+        raise HTTPException(
+            status_code=401,
+            detail="Google access revoked. Please log in again.",
+        )
+
+    if gmail_response.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Gmail API error: {gmail_response.text}",
+        )
+    message_data = gmail_response.json()
+
+
+
+    payload = message_data.get("payload")
+    if isinstance(payload, dict):
+        decode_payload_data(payload)
+
+    return message_data
+
+
+@router.post("/sync-message")
+def sync_messages( source: Optional[SourceType] = Query(None, description="Source to sync messages from"),current_user : User = Depends(get_current_user),db : Session = Depends(get_db)):
+    if source == SourceType.gdrive:
+        task = sync_drive_messages.delay(user_id=current_user.id)
+        return {
+            "message" : f"gdrive messages added in the task with {task.id}"
+        }
+    elif source == SourceType.gmail:
+        task = sync_gmail_messages.delay(user_id=current_user.id)
+        return {
+            "message" : f"gmail messages added in the task with {task.id}"
+        }
+    else:
+        task1 = sync_gmail_messages.delay(user_id=current_user.id)
+        task2 = sync_drive_messages.delay(user_id=current_user.id)
+        return {
+            "message" : f"gmail messages and gdrive added in the task with {task1.id} and {task2.id} respectively"
+        }
+
+
+@router.get("/task/status/{task_id}")
+def get_task_id(task_id : str,current_user : User = Depends(get_current_user),db : Session = Depends(get_db)):
+    task_result = AsyncResult(task_id, app=celery_app)
+    
+    result = None
+    if task_result.ready():
+        result = str(task_result.result) if task_result.failed() else task_result.result
+
+    return {
+        "task_id": task_id,
+        "status": task_result.status,  
+        "result": result
+    }
+
+
+
+# clicked on sync button - > background me saare messages aur drive ki files sync ho jani chahiye 
+#celery -> 
+    # first to ye hai ki messages ko save in the database and convert each in vector and store it 

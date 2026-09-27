@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useEffect } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { Layers, HardDrive, LogOut, CheckCircle } from 'lucide-react';
+import axios from 'axios';
 
 export const HomePage: React.FC = () => {
   const { token, user, logout } = useAuth();
@@ -11,6 +12,21 @@ export const HomePage: React.FC = () => {
     logout();
     navigate('/login');
   };
+
+  const fetchDriveData = async () => {
+    // const data = await axios.get("http://localhost:8000/download/google/drive/files/1Gt_xNhxKFsYzW2P9yPxJQ4GsgdyCPcizjVB82m34TtQ", {
+    // const data = await axios.get("http://localhost:8000/google/gmail/list", {
+    const data = await axios.get("http://localhost:8000/gmail/messages/1a0df2f0e6d25457", {
+      headers: {
+        "Authorization": `Bearer ${token}`
+      }
+    })
+    console.log(data);
+  }
+
+  useEffect(() => {
+    fetchDriveData();
+  }, [])
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-6 relative overflow-hidden">

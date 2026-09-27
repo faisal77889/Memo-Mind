@@ -31,6 +31,8 @@ class DataSources(Base):
     __tablename__ = "datasources"
 
     id = Column(Integer,primary_key=True,autoincrement=True)
+    name = Column(String,nullable=True)
+    mimeType = Column(String,nullable=False)
     type = Column(Enum(SourceType),nullable=False)
     unique_id = Column(String,nullable=False,unique=True,index=True)  #gmail id etc would be there
     content = Column(String)
