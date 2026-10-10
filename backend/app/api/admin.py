@@ -1,24 +1,49 @@
+from bs4 import BeautifulSoup
 from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import RedirectResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
+from google.auth.transport import requests as google_requests
 from dotenv import load_dotenv
 from typing import Optional
 import os
 import base64
+from sqlalchemy import Enum
 from urllib.parse import quote
 from app.database import get_db
-from app.models import User, DataSources, SourceType
+from app.models import User, DataSources, SourceType, Status, DocumentPages
 import httpx
 from celery.result import AsyncResult
 import jwt
 from google.oauth2 import id_token
 from datetime import datetime, timedelta
 from app.tasks import celery_app, sync_gmail_messages, sync_drive_messages
+from langchain_postgres import PGVector
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from typing import List
+
+
 
 load_dotenv(override=True)
 
 router = APIRouter(tags=["admin"])
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size = 400,
+    chunk_overlap = 50
+)
+
+embedding = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+
+vector_store = PGVector(
+    embeddings=embedding,
+    connection=os.getenv("DATABASE_URL"),
+    collection_name="gmail_and_docs",
+    use_jsonb=True
+)
+
 
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
@@ -149,6 +174,125 @@ async def get_file_info(file_id : str,google_access_token: str):
         return response
 
 
+def extract_email_data_for_embeddings(payload: dict) -> dict:
+    # 1. Extract only relevant headers
+    headers = {
+        h["name"].lower(): h["value"]
+        for h in payload.get("headers", [])
+        if "name" in h
+    }
+
+    metadata = {
+        "subject": headers.get("subject", ""),
+        "from": headers.get("from", ""),
+        "to": headers.get("to", ""),
+        "date": headers.get("date", ""),
+    }
+
+    # 2. Extract content prioritizing text/plain over text/html
+    text_plain = None
+    text_html = None
+
+    for part in payload.get("parts", []):
+        mime_type = part.get("mimeType", "")
+        data = part.get("body", {}).get("data", "")
+
+        if mime_type == "text/plain" and data:
+            text_plain = data
+        elif mime_type == "text/html" and data:
+            text_html = data
+
+    # 3. Determine final text to embed
+    if text_plain:
+        final_content = text_plain.strip()
+    elif text_html:
+        # Fallback only if plain text was not provided
+
+        soup = BeautifulSoup(text_html, "html.parser")
+        final_content = soup.get_text(separator="\n", strip=True)
+    else:
+        final_content = ""
+
+    # 4. Construct the chunk text to be embedded
+    chunk_to_embed = (
+        f"Subject: {metadata['subject']}\n"
+        f"From: {metadata['from']}\n"
+        f"Date: {metadata['date']}\n\n"
+        f"{final_content}"
+    )
+
+    
+
+    return {
+        "metadata": metadata,
+        "content_for_embedding": chunk_to_embed,
+        "raw_text_length": len(final_content),
+    }
+
+relevant_headers = ["From","To","Subject","Date"]
+
+def extract_content(parts : dict):
+    mimeType = parts.get("mimeType")
+    if mimeType == "text/plain":
+        return parts.get("body").get("data")
+        
+    if mimeType == "text/html":
+        raw_html = parts.get("body").get('data')
+        soup = BeautifulSoup(raw_html,'html.parser')
+        data = soup.get_text(separator="\n", strip=True)
+        return  data
+        
+
+        
+
+def findContent(payload : dict) -> dict:
+
+    mimeType = payload.get("mimeType")
+    headers = payload.get("headers")
+
+    headers_obj = {} 
+
+    for obj in headers:
+        if obj.get('name') in relevant_headers:
+            headers_obj[obj.get("name")] = obj.get("value")
+
+    data = None
+
+    if mimeType == "multipart/alternative":
+        data = extract_content(parts=payload.get("parts")[0])
+
+    elif mimeType == "multipart/mixed":
+        part = payload.get("parts")[0]
+        part_mimeType = part.get("mimeType")
+        if part_mimeType == "multipart/alternative":
+            data = extract_content(parts=part.get(parts)[0])
+        else:
+            data = extract_content(parts=payload.get(parts)[0])
+        # file = payload.get("parts")[1]
+
+    elif mimeType == "text/plain":
+        data = payload.get("body").get("data")
+
+    elif mimeType == "text/html":
+        soup = BeautifulSoup(payload.get("body").get("data"),'html.parser')
+        data = soup.get_text(separator="\n", strip=True)
+    # it must be multipart/related
+    else:
+        part = payload.get("parts")[0]
+        part_mimeType = part.get("mimeType")
+        if part_mimeType == "multipart/alternative":
+            data = extract_content(parts=part.get(parts)[0])
+        else:
+            data = extract_content(parts=payload.get(parts)[0])
+
+    return {
+        "metadata" : headers_obj,
+        "raw_content" : data
+    }
+
+
+
+
 
 def decode_payload_data(part: dict):
     if not isinstance(part, dict):
@@ -184,6 +328,8 @@ async def get_auth_url(
     }
     if email:
         params["login_hint"] = email
+        query_string = "&".join(f"{k}={v}" for k, v in params.items())
+        return RedirectResponse(url=f"{GOOGLE_AUTH_URL}?{query_string}")
 
     query_string = "&".join(f"{k}={v}" for k, v in params.items())
     return {"url": f"{GOOGLE_AUTH_URL}?{query_string}"}
@@ -208,6 +354,7 @@ async def auth_google(code: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=f"Token exchange failed: {e.response.text}")
 
     refresh_token = token_data.get("refresh_token")
+    print("refresh token",refresh_token)
     google_id_token = token_data.get("id_token")
 
     try:
@@ -228,15 +375,17 @@ async def auth_google(code: str, db: Session = Depends(get_db)):
     user_exist = db.query(User).filter(User.email == email).first()
 
     if user_exist:
+        print("inside the user_exist if")
         if user_exist.google_refresh_token:
             our_token = create_access_token(user_exist.id)
             return RedirectResponse(url=f"{frontend_url}/auth/callback?access_token={our_token}")
-    
+        print("passed the user exist")
 
         if not refresh_token:
+            print("refresh token is no there ")
             return RedirectResponse(url=f"{BACKEND_URL}/google/login?prompt=consent&email={quote(email)}")
             
-
+        print("passed the not refresh token")
         user_exist.google_refresh_token = refresh_token
         db.commit()
         our_token = create_access_token(user_exist.id)
@@ -267,6 +416,7 @@ async def get_drive_files(
     db: Session = Depends(get_db),
     page_size: int = 20,
 ):
+    print("The current user is ",current_user.google_refresh_token)
     google_access_token = await get_google_access_token(
         refresh_token=current_user.google_refresh_token,
         db=db,
@@ -325,12 +475,12 @@ async def download_file(file_id : str,current_user : User = Depends(get_current_
             url = f"https://www.googleapis.com/drive/v3/files/{file_id}/export"
             params = {"mimeType": workspace_mimes.get(mimeType, "application/pdf")}
             ext = workspace_extensions.get(mimeType, "pdf")
-            filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}"
+            filename = f"{file_id}.{ext}"
         else:
             url = f"https://www.googleapis.com/drive/v3/files/{file_id}"
             params = {"alt" : "media"}
             ext = mime_extensions.get(mimeType, "pdf")
-            filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.{ext}"
+            filename = f"{file_id}.{ext}"
         async with client.stream(
             "GET",
             url=url,
@@ -383,11 +533,13 @@ async def search_drive_files(
     return drive_resp.json()
 
 
-@router.get("/google/gmail/list")
+@router.get("/gmail/list")
 async def get_all_gmail_messages(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+
+    # first error is what if refresh token has expired - to be fixed 
     google_access_token = await get_google_access_token(
         str(current_user.google_refresh_token), db, current_user
     )
@@ -446,14 +598,80 @@ async def download_gmail_message(message_id : str,current_user : User = Depends(
             detail=f"Gmail API error: {gmail_response.text}",
         )
     message_data = gmail_response.json()
-
-
+    thread_id = message_data.get("threadId")
 
     payload = message_data.get("payload")
     if isinstance(payload, dict):
         decode_payload_data(payload)
 
-    return message_data
+    gmail_json = findContent(payload)
+    # gmail_json = extract_email_data_for_embeddings(payload)
+    if not gmail_json:
+        raise HTTPException(status_code=400,detail="gmail is not extracted properly")
+
+    gmail_json["threadId"] = thread_id
+
+    #save it in the database 
+
+    data_sources = DataSources(
+        name = gmail_json.get("metadata").get("Subject"),
+        mimeType = payload.get("mimeType"),
+        source = SourceType.gmail,
+        thread_id = thread_id,
+        unique_id = gmail_json.get("id"),
+        content = gmail_json,
+        status = Status.pending,
+        user_id = current_user.id
+    )
+
+    db.add(data_sources)
+    db.commit()
+
+    documents = []
+
+    body_chunks : List[str] = splitter.split_text(gmail_json.get("raw_content"))
+
+    if not body_chunks:
+        body_chunks = gmail_json.get("raw_content")
+
+    total_chunks = len(body_chunks)
+
+    document_pages = []
+    for idx, text in enumerate(body_chunks):
+        chunk_to_embed = (
+            f"Subject: {gmail_json.get("metadata").get("Subject")}\n"
+            f"From: {gmail_json.get("metadata").get("From")}\n"
+            f"Date: {gmail_json.get("metadata").get("To")}\n\n"
+            f"{text}"
+        )
+        embedding.embed_documents(chunk_to_embed)
+        doc = Document(
+            page_content=chunk_to_embed,
+            metadata = {
+                "gmail_id" : message_id,
+                "user_id" : current_user.id,
+                "thread_id" : thread_id,
+                "From" : gmail_json.get("metadata").get("From"),
+                "Subject" : gmail_json.get("metadata").get("Subject"),
+                "To" : gmail_json.get("metadata").get("To"),
+                "Date" : gmail_json.get("metadata").get("Date"),
+                "source" : "gmail",
+                "chunk_index" : idx,
+                "total_chunks" : total_chunks
+            }
+        )
+        documents.append(doc)
+        document_page = DocumentPages(
+            data_source_id = "1",
+            chunk = chunk_to_embed,
+            embedding = 
+        )
+
+
+    vector_store.add_documents(documents)
+
+   
+    return gmail_json
 
 
 @router.post("/sync-message")
@@ -490,6 +708,27 @@ def get_task_id(task_id : str,current_user : User = Depends(get_current_user),db
         "result": result
     }
 
+
+
+@router.get("/gmail/list/history")
+async def get_history(current_user : User = Depends(get_current_user), db : Session = Depends(get_db)):
+    google_access_token = await get_google_access_token(str(current_user.google_refresh_token),db,current_user)
+    print(current_user.id)
+    print("the google access token is ",google_access_token)
+    if not google_access_token:
+        raise HTTPException(status_code=401,detail="No google access token is found")
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url="https://gmail.googleapis.com/gmail/v1/users/me/history",headers={
+            "Authorization": f"Bearer {google_access_token}"
+        })
+
+    if response.status_code == 401:
+        raise HTTPException(status_code=401,detail="unauthorized via google access token")
+
+    # if response.status_code != 200 :
+    #     raise HTTPException(status_code=401,detail="Something is wrong")
+
+    return response.json()
 
 
 # clicked on sync button - > background me saare messages aur drive ki files sync ho jani chahiye 

@@ -15,8 +15,30 @@ export const HomePage: React.FC = () => {
 
   const fetchDriveData = async () => {
     // const data = await axios.get("http://localhost:8000/download/google/drive/files/1Gt_xNhxKFsYzW2P9yPxJQ4GsgdyCPcizjVB82m34TtQ", {
+    const data = await axios.get("http://localhost:8000/google/gmail/list", {
+      // const data = await axios.get("http://localhost:8000/gmail/messages/1a0df2f0e6d25457", {
+      headers: {
+        "Authorization": `Bearer ${token}`
+      }
+    })
+    console.log(data);
+  }
+
+  const fetchDriveDataMessage = async () => {
+    // const data = await axios.get("http://localhost:8000/download/google/drive/files/1Gt_xNhxKFsYzW2P9yPxJQ4GsgdyCPcizjVB82m34TtQ", {
     // const data = await axios.get("http://localhost:8000/google/gmail/list", {
-    const data = await axios.get("http://localhost:8000/gmail/messages/1a0df2f0e6d25457", {
+    const data = await axios.get("http://localhost:8000/gmail/messages/1a101842a4b5a914", {
+      headers: {
+        "Authorization": `Bearer ${token}`
+      }
+    })
+    console.log(data);
+  }
+
+  const fetchDriveData3 = async () => {
+    // const data = await axios.get("http://localhost:8000/download/google/drive/files/1Gt_xNhxKFsYzW2P9yPxJQ4GsgdyCPcizjVB82m34TtQ", {
+    // const data = await axios.get("http://localhost:8000/google/gmail/list", {
+    const data = await axios.get("http://localhost:8000/gmail/messages/1a105cec8eb29349", {
       headers: {
         "Authorization": `Bearer ${token}`
       }
@@ -26,7 +48,11 @@ export const HomePage: React.FC = () => {
 
   useEffect(() => {
     fetchDriveData();
+    fetchDriveDataMessage();
+    fetchDriveData3();
   }, [])
+
+
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center justify-center p-6 relative overflow-hidden">

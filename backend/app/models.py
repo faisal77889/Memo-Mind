@@ -2,6 +2,7 @@ from sqlalchemy import Column,Integer,String,Enum,ForeignKey,Boolean,JSON
 from app.database import Base
 from sqlalchemy.orm import relationship
 import enum
+from pgvector.sqlalchemy import Vector
 
 
 class Role(enum.Enum):
@@ -13,6 +14,13 @@ class SourceType(enum.Enum):
     slack = "slack"
     gmail = "gmail"
     gdrive = "gdrive"
+
+
+
+class Status(enum.Enum):
+    pending = "pending"
+    completed = "completed"
+    failed = "failed"
 
 
 class User(Base):
@@ -34,19 +42,23 @@ class DataSources(Base):
     name = Column(String,nullable=True)
     mimeType = Column(String,nullable=False)
     type = Column(Enum(SourceType),nullable=False)
+    thread_id = Column(String,nullable = True,index=True)
     unique_id = Column(String,nullable=False,unique=True,index=True)  #gmail id etc would be there
     content = Column(String)
+    status = Column(Enum(Status),default=Status.pending)
     user_id = Column(Integer,ForeignKey("users.id"),index=True)
 
     user = relationship("User",back_populates="datasources")
 
-class DataSourceVectors(Base):
+# add data source pages also
 
-    __tablename__ = "datasourcevector"
+class DocumentPages(Base):
+    __tablename__ = "document_pages"
 
-    id = Column(Integer,primary_key=True,autoincrement=True)
-    embedding = Column(Integer)  # will change it to vector
-
+    id = Column(Integer,primary_key=True, autoincrement=True)
+    data_source_id = Column(Integer,ForeignKey("datasources.id",ondelete="CASCADE"),index=True)
+    chunk = Column(String,nullable=False)
+    embedding = Column(Vector(768))
 
 class ChatActivity(Base):
 
