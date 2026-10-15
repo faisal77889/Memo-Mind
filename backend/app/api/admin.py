@@ -23,6 +23,8 @@ from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from typing import List
+import json
+from langchain_community.document_loaders import PyPDFLoader
 
 
 
@@ -35,11 +37,11 @@ splitter = RecursiveCharacterTextSplitter(
     chunk_overlap = 50
 )
 
-embedding = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+embedding = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001",output_dimensionality=768)
 
 vector_store = PGVector(
     embeddings=embedding,
-    connection=os.getenv("DATABASE_URL"),
+    connection=os.getenv("DB_URL"),
     collection_name="gmail_and_docs",
     use_jsonb=True
 )
@@ -457,10 +459,14 @@ async def download_file(file_id : str,current_user : User = Depends(get_current_
 
     file = db.query(DataSources).filter(DataSources.unique_id == file_id).first()
 
+
     if file :
         raise HTTPException(status_code=409,detail="The File already exist in the database")
 
     file_response = await get_file_info(file_id,google_access_token)
+
+    # return file_response.json()
+
 
     if file_response.status_code == 401:
         current_user.google_refresh_token = None
@@ -469,6 +475,17 @@ async def download_file(file_id : str,current_user : User = Depends(get_current_
 
     mimeType = file_response.json().get("mimeType", "")
     is_workspace = mimeType.startswith("application/vnd.google-apps") if mimeType else False
+
+    data_source = DataSources(
+        type = SourceType.gdrive,
+        unique_id = file_id,
+        user_id = current_user.id,
+        name = file_response.json().get("name",""),
+        mimeType = mimeType,
+        status = Status.pending
+    )
+    db.add(data_source)
+    db.commit()
 
     async with httpx.AsyncClient() as client:
         if is_workspace:
@@ -492,6 +509,37 @@ async def download_file(file_id : str,current_user : User = Depends(get_current_
             with open(filename, "wb") as f:
                 async for chunk in response.aiter_bytes(65536):
                     f.write(chunk)
+
+    loader = PyPDFLoader(filename)
+
+    document_pages = []
+
+    for page_doc in loader.lazy_load():
+        chunks = splitter.split_documents([page_doc])
+        page_num = page_doc.metadata.get("page", 0)
+
+        if not chunks:
+            continue
+        
+        chunk_text = []
+        doc_array = []
+        for chunk in chunks:
+            chunk_text.append(chunk.page_content)
+            vectors = embedding.embed_query(chunk.page_content)
+            doc = DocumentPages(
+                meta_data = page_num,
+                data_source_id = data_source.id,
+                chunk = chunk.page_content,
+                embedding = vectors
+            )
+            doc_array.append(doc)
+
+        for doc_page in doc_array:
+            document_pages.append(doc_page)
+
+    # save it to the database 
+    db.add_all(document_pages)
+    db.commit()
 
     return {
         "message" : "successfull"
@@ -573,7 +621,7 @@ async def get_all_gmail_messages(
 @router.get("/gmail/messages/{message_id}")
 async def download_gmail_message(message_id : str,current_user : User = Depends(get_current_user),db : Session = Depends(get_db)):
     google_access_token = await get_google_access_token(
-            str(current_user.google_refresh_token), db, current_user
+        str(current_user.google_refresh_token), db, current_user
     )
 
     async with httpx.AsyncClient() as client:
@@ -597,7 +645,9 @@ async def download_gmail_message(message_id : str,current_user : User = Depends(
             status_code=502,
             detail=f"Gmail API error: {gmail_response.text}",
         )
+    
     message_data = gmail_response.json()
+
     thread_id = message_data.get("threadId")
 
     payload = message_data.get("payload")
@@ -605,21 +655,23 @@ async def download_gmail_message(message_id : str,current_user : User = Depends(
         decode_payload_data(payload)
 
     gmail_json = findContent(payload)
+    gmail_content = json.dumps(gmail_json)
     # gmail_json = extract_email_data_for_embeddings(payload)
     if not gmail_json:
         raise HTTPException(status_code=400,detail="gmail is not extracted properly")
 
+    print(gmail_json)
+
     gmail_json["threadId"] = thread_id
 
-    #save it in the database 
 
     data_sources = DataSources(
-        name = gmail_json.get("metadata").get("Subject"),
+        name = gmail_json.get("metadata","").get("Subject"),
         mimeType = payload.get("mimeType"),
-        source = SourceType.gmail,
+        type = SourceType.gmail,
         thread_id = thread_id,
-        unique_id = gmail_json.get("id"),
-        content = gmail_json,
+        unique_id = message_id,
+        content = gmail_content,
         status = Status.pending,
         user_id = current_user.id
     )
@@ -627,51 +679,34 @@ async def download_gmail_message(message_id : str,current_user : User = Depends(
     db.add(data_sources)
     db.commit()
 
-    documents = []
-
     body_chunks : List[str] = splitter.split_text(gmail_json.get("raw_content"))
 
     if not body_chunks:
         body_chunks = gmail_json.get("raw_content")
 
-    total_chunks = len(body_chunks)
 
     document_pages = []
     for idx, text in enumerate(body_chunks):
         chunk_to_embed = (
-            f"Subject: {gmail_json.get("metadata").get("Subject")}\n"
-            f"From: {gmail_json.get("metadata").get("From")}\n"
-            f"Date: {gmail_json.get("metadata").get("To")}\n\n"
+            f"Subject: {gmail_json.get('metadata', {}).get('Subject', '')}\n"
+            f"From: {gmail_json.get('metadata', {}).get('From', '')}\n"
+            f"Date: {gmail_json.get('metadata', {}).get('To', '')}\n\n"
             f"{text}"
         )
-        embedding.embed_documents(chunk_to_embed)
-        doc = Document(
-            page_content=chunk_to_embed,
-            metadata = {
-                "gmail_id" : message_id,
-                "user_id" : current_user.id,
-                "thread_id" : thread_id,
-                "From" : gmail_json.get("metadata").get("From"),
-                "Subject" : gmail_json.get("metadata").get("Subject"),
-                "To" : gmail_json.get("metadata").get("To"),
-                "Date" : gmail_json.get("metadata").get("Date"),
-                "source" : "gmail",
-                "chunk_index" : idx,
-                "total_chunks" : total_chunks
-            }
-        )
-        documents.append(doc)
-        document_page = DocumentPages(
-            data_source_id = "1",
+        vector_embedding = embedding.embed_query(chunk_to_embed)
+        
+        doc_page = DocumentPages(
             chunk = chunk_to_embed,
-            embedding = 
+            data_source_id = data_sources.id,
+            embedding = vector_embedding
         )
+        document_pages.append(doc_page)
 
-
-    vector_store.add_documents(documents)
-
-   
-    return gmail_json
+    db.add_all(document_pages)
+    db.commit()
+    return {
+        "message" : f"gmail with message id - {message_id} is saved successfully"
+    }
 
 
 @router.post("/sync-message")

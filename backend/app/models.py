@@ -44,7 +44,7 @@ class DataSources(Base):
     type = Column(Enum(SourceType),nullable=False)
     thread_id = Column(String,nullable = True,index=True)
     unique_id = Column(String,nullable=False,unique=True,index=True)  #gmail id etc would be there
-    content = Column(String)
+    content = Column(String,nullable=True)
     status = Column(Enum(Status),default=Status.pending)
     user_id = Column(Integer,ForeignKey("users.id"),index=True)
 
@@ -56,6 +56,7 @@ class DocumentPages(Base):
     __tablename__ = "document_pages"
 
     id = Column(Integer,primary_key=True, autoincrement=True)
+    meta_data = Column(String,nullable=True)
     data_source_id = Column(Integer,ForeignKey("datasources.id",ondelete="CASCADE"),index=True)
     chunk = Column(String,nullable=False)
     embedding = Column(Vector(768))
