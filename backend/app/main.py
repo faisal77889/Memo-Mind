@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from app.api import admin
 from fastapi.middleware.cors import CORSMiddleware
+from app.api import agent
 
 app = FastAPI(
     title="Corporate-synapse-backend",
@@ -24,6 +25,7 @@ app.add_middleware(
 
 
 app.include_router(admin.router)
+app.include_router(agent.router)
 
 
 

@@ -1,6 +1,7 @@
-from sqlalchemy import Column,Integer,String,Enum,ForeignKey,Boolean,JSON
+from sqlalchemy import Column,Integer,String,Enum,ForeignKey,Boolean,JSON,Computed, Index
 from app.database import Base
 from sqlalchemy.orm import relationship
+from sqlalchemy.dialects.postgresql import TSVECTOR
 import enum
 from pgvector.sqlalchemy import Vector
 
@@ -52,6 +53,9 @@ class DataSources(Base):
 
 # add data source pages also
 
+# alter table document_pages add column tsv tsvector 
+# generated as always (to_tsvector('english',coalesce('chunk',''))) stored
+
 class DocumentPages(Base):
     __tablename__ = "document_pages"
 
@@ -59,7 +63,14 @@ class DocumentPages(Base):
     meta_data = Column(String,nullable=True)
     data_source_id = Column(Integer,ForeignKey("datasources.id",ondelete="CASCADE"),index=True)
     chunk = Column(String,nullable=False)
+    tsv = Column(
+            TSVECTOR,
+            Computed("to_tsvector('english',COALESCE(chunk,''))",persisted=True)
+        )
     embedding = Column(Vector(768))
+    __table_args__ = (
+        Index("idx_document_chunks_tsv", "tsv", postgresql_using="gin"),
+    )
 
 class ChatActivity(Base):
 
