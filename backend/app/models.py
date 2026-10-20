@@ -33,6 +33,8 @@ class User(Base):
     google_refresh_token = Column(String)
     #password = Column(String,nullable=False)
     role = Column(Enum(Role),nullable=False,default=Role.employee)
+    gdrive_page_token = Column(Integer, nullable=True)
+    gmailHistoryId = Column(String, nullable=True)
 
     datasources = relationship("DataSources",back_populates="user")
 

@@ -9,15 +9,13 @@ export const ProtectedRoute: React.FC<{ children: React.ReactElement }> = ({ chi
 
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-slate-950 flex flex-col items-center justify-center p-4">
-        <div className="relative flex items-center justify-center">
-          <div className="w-16 h-16 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center animate-pulse">
-            <Layers className="w-8 h-8 text-indigo-400" />
-          </div>
-          <div className="absolute inset-0 rounded-2xl border-2 border-indigo-500 border-t-transparent animate-spin" />
+      <div className="min-h-screen bg-[#0b0f19] flex flex-col items-center justify-center p-4">
+        <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center text-white mb-4 shadow-sm">
+          <Layers className="w-5 h-5" />
         </div>
-        <p className="mt-4 text-sm font-medium text-slate-400 animate-pulse">
-          Authenticating Synapse Workspace...
+        <div className="w-5 h-5 border-2 border-blue-500 border-t-transparent rounded-full animate-spin mb-3" />
+        <p className="text-xs font-medium text-slate-400">
+          Loading your workspace...
         </p>
       </div>
     );

@@ -39,3 +39,47 @@ export interface AuthContextType {
   logout: () => void;
   loginWithGoogle: () => Promise<void>;
 }
+
+export type SyncSourceType = 'gdrive' | 'gmail';
+
+export interface SyncResponse {
+  message: string;
+}
+
+export interface TaskStatusResponse {
+  task_id: string;
+  status: 'PENDING' | 'STARTED' | 'SUCCESS' | 'FAILURE' | 'RETRY' | string;
+  result?: {
+    status?: string;
+    synced_count?: number;
+    errors?: string[] | null;
+    detail?: string;
+  } | string | null;
+}
+
+export interface ChatMessage {
+  id: string;
+  sender: 'user' | 'assistant';
+  content: string;
+  timestamp: string;
+  isStreaming?: boolean;
+  isError?: boolean;
+  errorType?: 'rate_limit' | 'context_length' | 'quota' | 'auth' | 'general';
+}
+
+export interface GmailMessageItem {
+  id: string;
+  threadId: string;
+  subject?: string;
+  from?: string;
+  to?: string;
+  date?: string;
+  snippet?: string;
+  is_indexed?: boolean;
+}
+
+export interface GmailListResponse {
+  messages?: GmailMessageItem[];
+  nextPageToken?: string;
+  resultSizeEstimate?: number;
+}

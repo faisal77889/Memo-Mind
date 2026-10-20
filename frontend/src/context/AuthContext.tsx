@@ -5,7 +5,7 @@ import { getGoogleLoginUrl, authGoogle, getApiErrorMessage } from '../services/a
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 const TOKEN_KEY = 'access_token';
-const USER_KEY = 'corporate_synapse_user';
+const USER_KEY = 'memo_mind_user';
 
 export function cleanTokenString(input: string): string {
   if (!input) return '';
@@ -85,7 +85,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const payload = decodeJwtPayload(cleanedToken);
     const resolvedUser: User = {
       id: userData?.id || payload?.sub || 'user',
-      name: userData?.name || (payload?.sub ? `User #${payload.sub}` : 'Synapse User'),
+      name: userData?.name || (payload?.sub ? `User #${payload.sub}` : 'Memo User'),
       email: userData?.email || payload?.email,
       picture: userData?.picture,
       role: userData?.role || payload?.role || 'employee',

@@ -2,10 +2,12 @@ from bs4 import BeautifulSoup
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
 from dotenv import load_dotenv
-from typing import List
+from typing import List, Optional, Dict, Any
 import os
 import base64
 import json
+import logging
+import asyncio
 import httpx
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -16,137 +18,25 @@ from app.api.auth import get_current_user, get_google_access_token
 
 load_dotenv(override=True)
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["gmail"])
 
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size = 400,
-    chunk_overlap = 50
+    chunk_size=400,
+    chunk_overlap=50
 )
 
-embedding = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001",output_dimensionality=768)
+embedding = GoogleGenerativeAIEmbeddings(
+    model="models/gemini-embedding-001",
+    output_dimensionality=768
+)
 
-
-def extract_email_data_for_embeddings(payload: dict) -> dict:
-    # 1. Extract only relevant headers
-    headers = {
-        h["name"].lower(): h["value"]
-        for h in payload.get("headers", [])
-        if "name" in h
-    }
-
-    metadata = {
-        "subject": headers.get("subject", ""),
-        "from": headers.get("from", ""),
-        "to": headers.get("to", ""),
-        "date": headers.get("date", ""),
-    }
-
-    # 2. Extract content prioritizing text/plain over text/html
-    text_plain = None
-    text_html = None
-
-    for part in payload.get("parts", []):
-        mime_type = part.get("mimeType", "")
-        data = part.get("body", {}).get("data", "")
-
-        if mime_type == "text/plain" and data:
-            text_plain = data
-        elif mime_type == "text/html" and data:
-            text_html = data
-
-    # 3. Determine final text to embed
-    if text_plain:
-        final_content = text_plain.strip()
-    elif text_html:
-        # Fallback only if plain text was not provided
-
-        soup = BeautifulSoup(text_html, "html.parser")
-        final_content = soup.get_text(separator="\n", strip=True)
-    else:
-        final_content = ""
-
-    # 4. Construct the chunk text to be embedded
-    chunk_to_embed = (
-        f"Subject: {metadata['subject']}\n"
-        f"From: {metadata['from']}\n"
-        f"Date: {metadata['date']}\n\n"
-        f"{final_content}"
-    )
-
-    
-
-    return {
-        "metadata": metadata,
-        "content_for_embedding": chunk_to_embed,
-        "raw_text_length": len(final_content),
-    }
-
-relevant_headers = ["From","To","Subject","Date"]
-
-def extract_content(parts : dict):
-    mimeType = parts.get("mimeType")
-    if mimeType == "text/plain":
-        return parts.get("body").get("data")
-        
-    if mimeType == "text/html":
-        raw_html = parts.get("body").get('data')
-        soup = BeautifulSoup(raw_html,'html.parser')
-        data = soup.get_text(separator="\n", strip=True)
-        return  data
-        
-
-        
-
-def findContent(payload : dict) -> dict:
-
-    mimeType = payload.get("mimeType")
-    headers = payload.get("headers")
-
-    headers_obj = {} 
-
-    for obj in headers:
-        if obj.get('name') in relevant_headers:
-            headers_obj[obj.get("name")] = obj.get("value")
-
-    data = None
-
-    if mimeType == "multipart/alternative":
-        data = extract_content(parts=payload.get("parts")[0])
-
-    elif mimeType == "multipart/mixed":
-        part = payload.get("parts")[0]
-        part_mimeType = part.get("mimeType")
-        if part_mimeType == "multipart/alternative":
-            data = extract_content(parts=part.get(parts)[0])
-        else:
-            data = extract_content(parts=payload.get(parts)[0])
-        # file = payload.get("parts")[1]
-
-    elif mimeType == "text/plain":
-        data = payload.get("body").get("data")
-
-    elif mimeType == "text/html":
-        soup = BeautifulSoup(payload.get("body").get("data"),'html.parser')
-        data = soup.get_text(separator="\n", strip=True)
-    # it must be multipart/related
-    else:
-        part = payload.get("parts")[0]
-        part_mimeType = part.get("mimeType")
-        if part_mimeType == "multipart/alternative":
-            data = extract_content(parts=part.get(parts)[0])
-        else:
-            data = extract_content(parts=payload.get(parts)[0])
-
-    return {
-        "metadata" : headers_obj,
-        "raw_content" : data
-    }
-
-
-
+relevant_headers = ["From", "To", "Subject", "Date"]
 
 
 def decode_payload_data(part: dict):
+    """Recursively decodes URL-safe base64 encoded body data in place."""
     if not isinstance(part, dict):
         return
     body = part.get("body")
@@ -162,56 +52,233 @@ def decode_payload_data(part: dict):
     for sub_part in part.get("parts", []):
         decode_payload_data(sub_part)
 
+
+def extract_content(parts: dict) -> Optional[str]:
+    """Helper to extract text from a single MIME part."""
+    if not isinstance(parts, dict):
+        return None
+    mime_type = parts.get("mimeType", "")
+    body_data = parts.get("body", {}).get("data", "")
+    if not body_data:
+        return None
+
+    if mime_type == "text/plain":
+        return body_data
+    if mime_type == "text/html":
+        soup = BeautifulSoup(body_data, "html.parser")
+        return soup.get_text(separator="\n", strip=True)
+    return None
+
+
+def findContent(payload: dict) -> dict:
+    """
+    Extracts headers and body content across various MIME multipart structures.
+    Handles multipart/alternative, multipart/mixed, multipart/related, and plain/html.
+    """
+    if not isinstance(payload, dict):
+        return {"metadata": {}, "raw_content": ""}
+
+    headers_obj = {}
+    for obj in payload.get("headers", []):
+        name = obj.get("name")
+        if name in relevant_headers:
+            headers_obj[name] = obj.get("value", "")
+
+    # Recursively collect text/plain and text/html parts
+    text_plain_list = []
+    text_html_list = []
+
+    def collect_parts(part: dict):
+        if not isinstance(part, dict):
+            return
+        m_type = part.get("mimeType", "")
+        data = part.get("body", {}).get("data", "")
+        if isinstance(data, str) and data.strip():
+            if m_type == "text/plain":
+                text_plain_list.append(data.strip())
+            elif m_type == "text/html":
+                text_html_list.append(data.strip())
+        for sub_part in part.get("parts", []):
+            collect_parts(sub_part)
+
+    collect_parts(payload)
+
+    if text_plain_list:
+        data = "\n\n".join(text_plain_list)
+    elif text_html_list:
+        soup = BeautifulSoup("\n".join(text_html_list), "html.parser")
+        data = soup.get_text(separator="\n", strip=True)
+    else:
+        data = ""
+
+    return {
+        "metadata": headers_obj,
+        "raw_content": data
+    }
+
+
+def extract_email_data_for_embeddings(payload: dict) -> dict:
+    """Extracts email headers and plain content for embedding generation."""
+    parsed = findContent(payload)
+    meta = parsed.get("metadata", {})
+    raw_content = parsed.get("raw_content", "")
+
+    chunk_to_embed = (
+        f"Subject: {meta.get('Subject', '')}\n"
+        f"From: {meta.get('From', '')}\n"
+        f"Date: {meta.get('Date', '')}\n\n"
+        f"{raw_content}"
+    )
+
+    return {
+        "metadata": meta,
+        "content_for_embedding": chunk_to_embed,
+        "raw_text_length": len(raw_content),
+    }
+
+
 @router.get("/gmail/list")
 async def get_all_gmail_messages(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
+    max_results: int = 25,
 ):
+    """Fetches list of Gmail messages with rich metadata (subject, from, to, date, snippet)."""
+    if not current_user.google_refresh_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Google account not connected or refresh token missing. Please sign in again."
+        )
 
-    # first error is what if refresh token has expired - to be fixed 
     google_access_token = await get_google_access_token(
         str(current_user.google_refresh_token), db, current_user
     )
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         gmail_response = await client.get(
             "https://gmail.googleapis.com/gmail/v1/users/me/messages",
             headers={"Authorization": f"Bearer {google_access_token}"},
-            params={"maxResults": 50},
+            params={"maxResults": max_results},
         )
 
-    if gmail_response.status_code == 401:
-        current_user.google_refresh_token = None
-        db.commit()
-        raise HTTPException(
-            status_code=401,
-            detail="Google access revoked. Please log in again.",
+        if gmail_response.status_code == 401:
+            current_user.google_refresh_token = None
+            db.commit()
+            raise HTTPException(
+                status_code=401,
+                detail="Google access revoked. Please log in again.",
+            )
+
+        if gmail_response.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Gmail API error: {gmail_response.text}",
+            )
+
+        list_data = gmail_response.json()
+        raw_messages = list_data.get("messages", [])
+
+        if not raw_messages:
+            return {
+                "messages": [],
+                "nextPageToken": list_data.get("nextPageToken"),
+                "resultSizeEstimate": 0
+            }
+
+        # Check which messages are already completed in DataSources
+        msg_ids = [m["id"] for m in raw_messages if "id" in m]
+        indexed_ids = set(
+            row[0] for row in db.query(DataSources.unique_id)
+            .filter(DataSources.unique_id.in_(msg_ids), DataSources.status == Status.completed)
+            .all()
         )
 
-    if gmail_response.status_code != 200:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Gmail API error: {gmail_response.text}",
-        )
+        # Concurrently fetch format=metadata with concurrency limit
+        sem = asyncio.Semaphore(12)
 
-    return gmail_response.json()
+        async def fetch_meta(msg_item: dict) -> dict:
+            m_id = msg_item.get("id")
+            thread_id = msg_item.get("threadId", "")
+            if not m_id:
+                return msg_item
 
+            async with sem:
+                try:
+                    resp = await client.get(
+                        f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{m_id}",
+                        headers={"Authorization": f"Bearer {google_access_token}"},
+                        params={
+                            "format": "metadata",
+                            "metadataHeaders": ["Subject", "From", "To", "Date"]
+                        }
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        headers_list = data.get("payload", {}).get("headers", [])
+                        headers_map = {
+                            h.get("name", "").lower(): h.get("value", "")
+                            for h in headers_list
+                        }
+                        return {
+                            "id": m_id,
+                            "threadId": thread_id or data.get("threadId", ""),
+                            "subject": headers_map.get("subject") or f"Email #{m_id[:8]}",
+                            "from": headers_map.get("from", ""),
+                            "to": headers_map.get("to", ""),
+                            "date": headers_map.get("date", ""),
+                            "snippet": data.get("snippet", ""),
+                            "is_indexed": m_id in indexed_ids
+                        }
+                except Exception as ex:
+                    logger.warning(f"Failed to fetch metadata for message {m_id}: {ex}")
 
+            return {
+                "id": m_id,
+                "threadId": thread_id,
+                "subject": f"Email #{m_id[:8]}",
+                "from": "",
+                "to": "",
+                "date": "",
+                "snippet": "",
+                "is_indexed": m_id in indexed_ids
+            }
+
+        rich_messages = await asyncio.gather(*(fetch_meta(m) for m in raw_messages))
+
+        return {
+            "messages": list(rich_messages),
+            "nextPageToken": list_data.get("nextPageToken"),
+            "resultSizeEstimate": list_data.get("resultSizeEstimate", len(rich_messages))
+        }
 
 
 @router.get("/gmail/messages/{message_id}")
-async def download_gmail_message(message_id : str,current_user : User = Depends(get_current_user),db : Session = Depends(get_db)):
+async def download_gmail_message(
+    message_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Downloads an individual Gmail message, decodes its payload, creates chunks,
+    generates batch vector embeddings, and stores them into Synapse database.
+    """
+    if not current_user.google_refresh_token:
+        raise HTTPException(
+            status_code=401,
+            detail="Google account not connected. Please log in again."
+        )
+
     google_access_token = await get_google_access_token(
         str(current_user.google_refresh_token), db, current_user
     )
 
-    async with httpx.AsyncClient() as client:
+    # 1. Fetch message data from Google Gmail API
+    async with httpx.AsyncClient(timeout=30.0) as client:
         gmail_response = await client.get(
             f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}",
             headers={"Authorization": f"Bearer {google_access_token}"},
-            params={"format" : "full"}
+            params={"format": "full"}
         )
-        
 
     if gmail_response.status_code == 401:
         current_user.google_refresh_token = None
@@ -223,89 +290,167 @@ async def download_gmail_message(message_id : str,current_user : User = Depends(
 
     if gmail_response.status_code != 200:
         raise HTTPException(
-            status_code=502,
+            status_code=gmail_response.status_code,
             detail=f"Gmail API error: {gmail_response.text}",
         )
-    
+
     message_data = gmail_response.json()
+    thread_id = message_data.get("threadId", "")
 
-    thread_id = message_data.get("threadId")
-
-    payload = message_data.get("payload")
+    payload = message_data.get("payload", {})
     if isinstance(payload, dict):
         decode_payload_data(payload)
 
     gmail_json = findContent(payload)
-    gmail_content = json.dumps(gmail_json)
-    # gmail_json = extract_email_data_for_embeddings(payload)
     if not gmail_json:
-        raise HTTPException(status_code=400,detail="gmail is not extracted properly")
-
-    print(gmail_json)
+        raise HTTPException(status_code=400, detail="Failed to extract content from email payload.")
 
     gmail_json["threadId"] = thread_id
+    gmail_content = json.dumps(gmail_json)
 
+    subject = gmail_json.get("metadata", {}).get("Subject") or f"Email #{message_id[:8]}"
+    from_addr = gmail_json.get("metadata", {}).get("From", "")
+    to_addr = gmail_json.get("metadata", {}).get("To", "")
+    date_str = gmail_json.get("metadata", {}).get("Date", "")
 
-    data_sources = DataSources(
-        name = gmail_json.get("metadata","").get("Subject"),
-        mimeType = payload.get("mimeType"),
-        type = SourceType.gmail,
-        thread_id = thread_id,
-        unique_id = message_id,
-        content = gmail_content,
-        status = Status.pending,
-        user_id = current_user.id
-    )
-
-    db.add(data_sources)
-    db.commit()
-
-    body_chunks : List[str] = splitter.split_text(gmail_json.get("raw_content"))
-
-    if not body_chunks:
-        body_chunks = gmail_json.get("raw_content")
-
-
-    document_pages = []
-    for idx, text in enumerate(body_chunks):
-        chunk_to_embed = (
-            f"Subject: {gmail_json.get('metadata', {}).get('Subject', '')}\n"
-            f"From: {gmail_json.get('metadata', {}).get('From', '')}\n"
-            f"Date: {gmail_json.get('metadata', {}).get('To', '')}\n\n"
-            f"{text}"
+    # 2. Check existing DataSources record to avoid UniqueViolation and allow re-indexing
+    existing = db.query(DataSources).filter(DataSources.unique_id == message_id).first()
+    if existing:
+        if existing.status == Status.completed:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Email #{message_id[:8]} is already indexed in the database."
+            )
+        data_sources = existing
+        data_sources.name = subject
+        data_sources.mimeType = payload.get("mimeType", "message/rfc822")
+        data_sources.thread_id = thread_id
+        data_sources.content = gmail_content
+        data_sources.status = Status.pending
+        db.commit()
+        # Clean up any partial document pages from prior failed attempt
+        db.query(DocumentPages).filter(DocumentPages.data_source_id == data_sources.id).delete()
+        db.commit()
+    else:
+        data_sources = DataSources(
+            name=subject,
+            mimeType=payload.get("mimeType", "message/rfc822"),
+            type=SourceType.gmail,
+            thread_id=thread_id,
+            unique_id=message_id,
+            content=gmail_content,
+            status=Status.pending,
+            user_id=current_user.id
         )
-        vector_embedding = embedding.embed_query(chunk_to_embed)
-        
-        doc_page = DocumentPages(
-            chunk = chunk_to_embed,
-            data_source_id = data_sources.id,
-            embedding = vector_embedding
-        )
-        document_pages.append(doc_page)
+        db.add(data_sources)
+        db.commit()
+        db.refresh(data_sources)
 
-    db.add_all(document_pages)
-    db.commit()
-    return {
-        "message" : f"gmail with message id - {message_id} is saved successfully"
-    }
+    try:
+        raw_text = gmail_json.get("raw_content") or ""
+        if raw_text.strip():
+            body_chunks = splitter.split_text(raw_text)
+        else:
+            body_chunks = [f"Subject: {subject}\nFrom: {from_addr}\nTo: {to_addr}\nDate: {date_str}"]
+
+        if not body_chunks:
+            body_chunks = [f"Subject: {subject}\nFrom: {from_addr}\nDate: {date_str}"]
+
+        # 3. Construct chunk texts with email context
+        chunks_to_embed: List[str] = []
+        for text in body_chunks:
+            chunk_to_embed = (
+                f"Subject: {subject}\n"
+                f"From: {from_addr}\n"
+                f"To: {to_addr}\n"
+                f"Date: {date_str}\n\n"
+                f"{text}"
+            )
+            chunks_to_embed.append(chunk_to_embed)
+
+        # 4. Batch generate embeddings to prevent rate limits
+        batch_size = 50
+        all_embeddings = []
+        for i in range(0, len(chunks_to_embed), batch_size):
+            batch = chunks_to_embed[i:i + batch_size]
+            batch_emb = embedding.embed_documents(batch)
+            all_embeddings.extend(batch_emb)
+
+        # 5. Create and commit DocumentPages
+        document_pages = [
+            DocumentPages(
+                chunk=chunk_str,
+                data_source_id=data_sources.id,
+                embedding=emb,
+                meta_data=json.dumps({
+                    "subject": subject,
+                    "from": from_addr,
+                    "to": to_addr,
+                    "date": date_str,
+                    "thread_id": thread_id
+                })
+            )
+            for chunk_str, emb in zip(chunks_to_embed, all_embeddings)
+        ]
+
+        db.add_all(document_pages)
+
+        # 6. Mark status as completed
+        data_sources.status = Status.completed
+        db.commit()
+
+        return {
+            "message": f"Gmail message #{message_id[:8]} indexed successfully into Synapse.",
+            "message_id": message_id,
+            "chunks_count": len(document_pages)
+        }
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error processing Gmail message {message_id}: {str(e)}", exc_info=True)
+        if data_sources:
+            data_sources.status = Status.failed
+            db.commit()
+        raise HTTPException(status_code=500, detail=f"Failed to process email message: {str(e)}")
 
 
 @router.get("/gmail/list/history")
-async def get_history(current_user : User = Depends(get_current_user), db : Session = Depends(get_db)):
-    google_access_token = await get_google_access_token(str(current_user.google_refresh_token),db,current_user)
-    print(current_user.id)
-    print("the google access token is ",google_access_token)
-    if not google_access_token:
-        raise HTTPException(status_code=401,detail="No google access token is found")
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url="https://gmail.googleapis.com/gmail/v1/users/me/history",headers={
-            "Authorization": f"Bearer {google_access_token}"
-        })
+async def get_history(
+    start_history_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Fetches Gmail history records using startHistoryId or user's stored historyId."""
+    if not current_user.google_refresh_token:
+        raise HTTPException(status_code=401, detail="No Google refresh token found.")
+
+    history_id = start_history_id or current_user.gmailHistoryId
+    if not history_id:
+        raise HTTPException(
+            status_code=400,
+            detail="start_history_id parameter or user's gmailHistoryId is required for history tracking."
+        )
+
+    google_access_token = await get_google_access_token(
+        str(current_user.google_refresh_token), db, current_user
+    )
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            url="https://gmail.googleapis.com/gmail/v1/users/me/history",
+            headers={"Authorization": f"Bearer {google_access_token}"},
+            params={"startHistoryId": history_id}
+        )
 
     if response.status_code == 401:
-        raise HTTPException(status_code=401,detail="unauthorized via google access token")
+        current_user.google_refresh_token = None
+        db.commit()
+        raise HTTPException(status_code=401, detail="Google access revoked. Please log in again.")
 
-    # if response.status_code != 200 :
-    #     raise HTTPException(status_code=401,detail="Something is wrong")
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Gmail history API error: {response.text}"
+        )
 
     return response.json()
