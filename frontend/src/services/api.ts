@@ -194,12 +194,17 @@ export async function streamAiMessage(
  * Chat Session Management APIs
  */
 export async function fetchChatSessions(token: string): Promise<ChatSession[]> {
-  const response = await apiClient.get<ChatSession[]>('/chat/sessions', {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
-  return response.data;
+  try {
+    const response = await apiClient.get<ChatSession[]>('/chat/sessions', {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    return Array.isArray(response.data) ? response.data : [];
+  } catch (err) {
+    console.warn('Failed to fetch chat sessions:', err);
+    return [];
+  }
 }
 
 export async function createChatSession(token: string, title?: string): Promise<ChatSession> {
@@ -245,13 +250,18 @@ export async function deleteChatSession(token: string, chatId: number): Promise<
   });
 }
 
-export async function fetchChatActivityStats(token: string): Promise<ChatActivityStats> {
-  const response = await apiClient.get<ChatActivityStats>('/chat/activity-stats', {
-    headers: {
-      Authorization: `Bearer ${token}`,
-    },
-  });
-  return response.data;
+export async function fetchChatActivityStats(token: string): Promise<ChatActivityStats | null> {
+  try {
+    const response = await apiClient.get<ChatActivityStats>('/chat/activity-stats', {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    return response.data;
+  } catch (err) {
+    console.warn('Failed to fetch chat activity stats:', err);
+    return null;
+  }
 }
 
 /**

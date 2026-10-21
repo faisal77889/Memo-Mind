@@ -104,12 +104,13 @@ export const ChatPage: React.FC = () => {
         fetchChatSessions(token),
         fetchChatActivityStats(token).catch(() => null),
       ]);
-      setSessions(sessionsData);
+      const safeSessions = Array.isArray(sessionsData) ? sessionsData : [];
+      setSessions(safeSessions);
       if (statsData) setActivityStats(statsData);
 
       // If a preferred session ID is given, or if activeSessionId is not set, select the first
       if (preferredSelectId) {
-        const found = sessionsData.find((s) => s.id === preferredSelectId);
+        const found = safeSessions.find((s) => s.id === preferredSelectId);
         if (found) {
           setActiveSessionId(found.id);
           setActiveSessionTitle(found.title);
@@ -117,6 +118,7 @@ export const ChatPage: React.FC = () => {
       }
     } catch (err) {
       console.error('Error loading chat sessions:', err);
+      setSessions([]);
     } finally {
       setIsLoadingSessions(false);
     }
@@ -379,8 +381,9 @@ export const ChatPage: React.FC = () => {
 
   // Group sessions by timeframe
   const groupedSessions = useMemo(() => {
-    const filtered = sessions.filter((s) =>
-      s.title.toLowerCase().includes(sessionSearch.toLowerCase())
+    const sessionList = Array.isArray(sessions) ? sessions : [];
+    const filtered = sessionList.filter((s) =>
+      s && typeof s.title === 'string' && s.title.toLowerCase().includes(sessionSearch.toLowerCase())
     );
 
     const now = new Date();
@@ -411,7 +414,7 @@ export const ChatPage: React.FC = () => {
     return groups;
   }, [sessions, sessionSearch]);
 
-  const activeSessionObj = sessions.find((s) => s.id === activeSessionId);
+  const activeSessionObj = Array.isArray(sessions) ? sessions.find((s) => s.id === activeSessionId) : undefined;
 
   return (
     <div className="h-screen bg-[#f7f7f5] dark:bg-[#101613] flex flex-col text-stone-900 dark:text-stone-100 overflow-hidden transition-colors duration-200">
@@ -478,12 +481,12 @@ export const ChatPage: React.FC = () => {
 
           {/* Sidebar Chat Sessions List */}
           <div className="flex-1 overflow-y-auto p-2 space-y-4 scrollbar-thin">
-            {isLoadingSessions && sessions.length === 0 ? (
+            {isLoadingSessions && (!Array.isArray(sessions) || sessions.length === 0) ? (
               <div className="p-4 text-center text-xs text-stone-400 space-y-2">
                 <div className="w-4 h-4 border-2 border-stone-400 border-t-transparent rounded-full animate-spin mx-auto" />
                 <span>Loading past conversations...</span>
               </div>
-            ) : sessions.length === 0 ? (
+            ) : !Array.isArray(sessions) || sessions.length === 0 ? (
               <div className="p-6 text-center space-y-2 text-xs text-stone-400">
                 <MessageSquare className="w-8 h-8 mx-auto text-stone-300 dark:text-stone-600" />
                 <p>No conversations yet. Start a new chat to begin!</p>
