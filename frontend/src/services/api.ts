@@ -1,5 +1,14 @@
 import axios, { AxiosError } from 'axios';
-import type { DriveFile, DriveFilesResponse, GoogleAuthUrlResponse, AuthTokenResponse, GmailListResponse } from '../types';
+import type {
+  DriveFile,
+  DriveFilesResponse,
+  GoogleAuthUrlResponse,
+  AuthTokenResponse,
+  GmailListResponse,
+  ChatSession,
+  ChatSessionDetail,
+  ChatActivityStats,
+} from '../types';
 
 const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
@@ -124,22 +133,41 @@ export async function getTaskStatus(token: string, taskId: string): Promise<any>
 }
 
 /**
- * 8. Real-time Streaming AI Chat
+ * 8. Real-time Streaming AI Chat with Session Context
  */
 export async function streamAiMessage(
   query: string,
   onChunk: (chunk: string) => void,
-  onComplete: () => void,
+  onComplete: (chatId?: number) => void,
   onError: (err: any) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  chatId?: number,
+  token?: string | null
 ): Promise<void> {
   try {
-    const url = `${API_BASE_URL}/ai-message?query=${encodeURIComponent(query)}`;
-    const response = await fetch(url, { signal });
+    const params = new URLSearchParams({ query });
+    if (chatId) {
+      params.append('chat_id', chatId.toString());
+    }
+    if (token) {
+      params.append('token', token);
+    }
+
+    const url = `${API_BASE_URL}/ai-message?${params.toString()}`;
+    const headers: Record<string, string> = {};
+    if (token) {
+      headers['Authorization'] = `Bearer ${token}`;
+    }
+
+    const response = await fetch(url, { signal, headers });
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(`AI Chat error (${response.status}): ${errorText || response.statusText}`);
     }
+
+    // Capture created or active chat id header if returned
+    const headerChatId = response.headers.get('X-Chat-Id');
+    const returnedChatId = headerChatId ? parseInt(headerChatId, 10) : chatId;
 
     const reader = response.body?.getReader();
     if (!reader) {
@@ -155,11 +183,75 @@ export async function streamAiMessage(
         onChunk(text);
       }
     }
-    onComplete();
+    onComplete(returnedChatId);
   } catch (err: any) {
     if (err.name === 'AbortError') return;
     onError(err);
   }
+}
+
+/**
+ * Chat Session Management APIs
+ */
+export async function fetchChatSessions(token: string): Promise<ChatSession[]> {
+  const response = await apiClient.get<ChatSession[]>('/chat/sessions', {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  return response.data;
+}
+
+export async function createChatSession(token: string, title?: string): Promise<ChatSession> {
+  const response = await apiClient.post<ChatSession>(
+    '/chat/sessions',
+    { title: title || 'New Conversation' },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    }
+  );
+  return response.data;
+}
+
+export async function fetchChatSessionDetails(token: string, chatId: number): Promise<ChatSessionDetail> {
+  const response = await apiClient.get<ChatSessionDetail>(`/chat/sessions/${chatId}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  return response.data;
+}
+
+export async function renameChatSession(token: string, chatId: number, title: string): Promise<ChatSession> {
+  const response = await apiClient.patch<ChatSession>(
+    `/chat/sessions/${chatId}`,
+    { title },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    }
+  );
+  return response.data;
+}
+
+export async function deleteChatSession(token: string, chatId: number): Promise<void> {
+  await apiClient.delete(`/chat/sessions/${chatId}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+}
+
+export async function fetchChatActivityStats(token: string): Promise<ChatActivityStats> {
+  const response = await apiClient.get<ChatActivityStats>('/chat/activity-stats', {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+  return response.data;
 }
 
 /**

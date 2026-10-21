@@ -83,3 +83,38 @@ export interface GmailListResponse {
   nextPageToken?: string;
   resultSizeEstimate?: number;
 }
+
+export interface ChatTurn {
+  id: number;
+  query: string;
+  answer: string;
+  order: number;
+  created_at: string;
+}
+
+export interface ChatSession {
+  id: number;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  total_messages: number;
+  last_active: string;
+  preview: string;
+  activity_level: 'active' | 'recent' | 'idle';
+}
+
+export interface ChatSessionDetail {
+  id: number;
+  title: string;
+  created_at: string;
+  updated_at: string;
+  total_messages: number;
+  turns: ChatTurn[];
+}
+
+export interface ChatActivityStats {
+  total_conversations: number;
+  total_messages: number;
+  active_days: number;
+  last_active?: string | null;
+}

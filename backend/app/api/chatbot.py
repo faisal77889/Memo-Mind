@@ -141,18 +141,33 @@ checkpointer = InMemorySaver()
 chat_bot = graph.compile(checkpointer=checkpointer)
 
 
-async def chat_bot_fn(query: str, thread_id: Optional[str] = None):
+async def chat_bot_fn(
+    query: str,
+    thread_id: Optional[str] = None,
+    history: Optional[List[dict]] = None,
+    on_finish = None,
+):
     """
     Runs the RAG conversational graph and streams back real-time text chunks.
+    Allows injecting conversation history for continuity and triggers on_finish(full_text) to persist messages.
     """
     if not thread_id:
         thread_id = str(uuid.uuid4())
     session_config = {"configurable": {"thread_id": thread_id}}
-    message = HumanMessage(content=query)
 
+    input_messages: List[BaseMessage] = []
+    if history:
+        for turn in history:
+            if turn.get("query"):
+                input_messages.append(HumanMessage(content=turn["query"]))
+            if turn.get("answer"):
+                input_messages.append(AIMessage(content=turn["answer"]))
+    input_messages.append(HumanMessage(content=query))
+
+    accumulated_response = []
     try:
         async for message_chunk, metadata in chat_bot.astream(
-            {"messages": [message]},
+            {"messages": input_messages},
             config=session_config,
             stream_mode="messages"
         ):
@@ -164,6 +179,7 @@ async def chat_bot_fn(query: str, thread_id: Optional[str] = None):
             ):
                 content = message_chunk.content
                 if isinstance(content, str) and content:
+                    accumulated_response.append(content)
                     words = content.split(" ")
                     for i in range(0, len(words), 2):
                         chunk_str = " ".join(words[i:i+2])
@@ -173,13 +189,27 @@ async def chat_bot_fn(query: str, thread_id: Optional[str] = None):
                         await asyncio.sleep(0.015)
                 elif isinstance(content, list):
                     for item in content:
+                        text_val = ""
                         if isinstance(item, str):
-                            yield item
+                            text_val = item
                         elif isinstance(item, dict) and "text" in item:
-                            yield item["text"]
-                        await asyncio.sleep(0.015)
+                            text_val = item["text"]
+                        if text_val:
+                            accumulated_response.append(text_val)
+                            yield text_val
+                            await asyncio.sleep(0.015)
     except Exception as e:
         logger.error(f"Error streaming response from chatbot: {e}", exc_info=True)
         yield f"\n\n[Error generating response: {str(e)}]"
+    finally:
+        full_text = "".join(accumulated_response).strip()
+        if on_finish and full_text:
+            try:
+                if asyncio.iscoroutinefunction(on_finish):
+                    await on_finish(full_text)
+                else:
+                    on_finish(full_text)
+            except Exception as fe:
+                logger.error(f"Error in on_finish callback: {fe}", exc_info=True)
 
 
